@@ -1,0 +1,1405 @@
+#!/usr/bin/env python3
+"""tuxmote - lets the Rowmote Pro iOS app control a Linux desktop.
+
+Unofficial, independent implementation of the helper protocol the app speaks (as of helper 4.2.5).
+Input is injected through /dev/uinput, which works on Wayland and X11 alike.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import ctypes
+import ctypes.util
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+log = logging.getLogger('tuxmote')
+
+HELPER_VERSION = '4.2.5'
+LEGACY_VERSION = '3.6.11'
+REPORTED_OS = 'OSX.14.0.0'
+DEFAULT_PORT = 5842
+THIS_COMPUTER_ID = 'com.regularrateandrhythm.thiscomputer'
+
+CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'tuxmote'
+CONFIG_FILE = CONFIG_DIR / 'config.json'
+KEYS_FILE = CONFIG_DIR / 'keys.json'
+CONTROL_SOCKET = Path(os.environ.get('XDG_RUNTIME_DIR') or '/tmp') / 'tuxmote.sock'
+
+DEFAULT_CONFIG = {
+    'port': DEFAULT_PORT,
+    'cmd_key': 'ctrl',
+    'scroll_direction': 0,
+    'scroll_scale': 4.0,
+    'pointer_scale': 1.0,
+    'three_finger_drag': False,
+    'fkeys_as_media': True,
+    'pinch_zoom': 'screen',
+    'pause_on_call': True,
+    'allow_power_commands': True,
+    'keyboard_layout': '',
+}
+
+EV_SYN, EV_KEY, EV_REL = 0x00, 0x01, 0x02
+SYN_REPORT = 0
+REL_X, REL_Y, REL_HWHEEL, REL_WHEEL = 0x00, 0x01, 0x06, 0x08
+REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES = 0x0B, 0x0C
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+
+KEY_ESC, KEY_BACKSPACE, KEY_TAB, KEY_ENTER, KEY_SPACE = 1, 14, 15, 28, 57
+KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_LEFTMETA = 29, 42, 56, 125
+KEY_RIGHTCTRL, KEY_RIGHTSHIFT, KEY_RIGHTALT = 97, 54, 100
+KEY_HOME, KEY_UP, KEY_PAGEUP, KEY_LEFT, KEY_RIGHT = 102, 103, 104, 105, 106
+KEY_END, KEY_DOWN, KEY_PAGEDOWN, KEY_INSERT, KEY_DELETE = 107, 108, 109, 110, 111
+KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP, KEY_HELP = 113, 114, 115, 138
+KEY_EJECTCD, KEY_NEXTSONG, KEY_PLAYPAUSE, KEY_PREVIOUSSONG = 161, 163, 164, 165
+KEY_REWIND, KEY_PAUSECD, KEY_FASTFORWARD = 168, 201, 208
+KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
+F_KEYS = [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88] + list(range(183, 195))
+
+NS_UP, NS_DOWN, NS_LEFT, NS_RIGHT, NS_F1 = 0xF700, 0xF701, 0xF702, 0xF703, 0xF704
+NS_FUNCTION_KEYS = {
+    NS_UP: KEY_UP, NS_DOWN: KEY_DOWN, NS_LEFT: KEY_LEFT, NS_RIGHT: KEY_RIGHT,
+    **{NS_F1 + i: code for i, code in enumerate(F_KEYS)},
+    0xF727: KEY_INSERT, 0xF728: KEY_DELETE, 0xF729: KEY_HOME, 0xF72B: KEY_END,
+    0xF72C: KEY_PAGEUP, 0xF72D: KEY_PAGEDOWN, 0xF746: KEY_HELP,
+}
+CONTROL_CHARS = {
+    3: KEY_ENTER, 8: KEY_BACKSPACE, 9: KEY_TAB, 10: KEY_ENTER, 13: KEY_ENTER, 25: KEY_TAB,
+    27: KEY_ESC, 32: KEY_SPACE, 127: KEY_BACKSPACE,
+}
+KEYBOARD_CODES = range(1, 249)
+KEYPAD_CODES = frozenset([55, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 96, 98, 117, 121])
+
+# Same lookup table as the macOS helper (remote button -> NSEvent character code).
+REMOTE_BUTTON_CHARS = {'UP': NS_UP, 'DOWN': NS_DOWN, 'LEFT': NS_LEFT, 'RIGHT': NS_RIGHT,
+                       'SELECT': 0x20, 'MENU': 0x1B, 'ENTER': 0x0D}
+
+MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_CMD = 'shift', 'ctrl', 'opt', 'cmd'
+
+POINT_RE = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+INT_RE = re.compile(r'^\s*([-+]?\d+)')
+
+
+def parse_point(text: str) -> tuple[float, float] | None:
+    numbers = POINT_RE.findall(text)
+    if len(numbers) < 2:
+        return None
+    return float(numbers[0]), float(numbers[1])
+
+
+def parse_int(text: str | None, default: int = 0) -> int:
+    match = INT_RE.match(text or '')
+    return int(match.group(1)) if match else default
+
+
+def parse_float(text: str | None, default: float = 0.0) -> float:
+    match = POINT_RE.search(text or '')
+    return float(match.group(0)) if match else default
+
+
+def run(cmd: list[str], timeout: float = 5.0) -> str | None:
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        log.debug('%s failed: %s', cmd[0], error)
+        return None
+    if result.returncode != 0:
+        log.debug('%s exited %s: %s', ' '.join(cmd), result.returncode, result.stderr.strip())
+        return None
+    return result.stdout
+
+
+def spawn(cmd: list[str]) -> bool:
+    if not shutil.which(cmd[0]):
+        log.warning('%s is not installed', cmd[0])
+        return False
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    return True
+
+
+class Settings:
+    def __init__(self) -> None:
+        self.values = dict(DEFAULT_CONFIG)
+        try:
+            self.values.update(json.loads(CONFIG_FILE.read_text()))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            log.warning('Ignoring unreadable %s: %s', CONFIG_FILE, error)
+
+    def __getitem__(self, key: str):
+        return self.values[key]
+
+    def set(self, key: str, value) -> None:
+        self.values[key] = value
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(self.values, indent=2) + '\n')
+
+
+class KeyStore:
+    def __init__(self) -> None:
+        try:
+            self.keys = set(json.loads(KEYS_FILE.read_text()))
+        except FileNotFoundError:
+            self.keys = set()
+        except (OSError, ValueError) as error:
+            log.warning('Ignoring unreadable %s: %s', KEYS_FILE, error)
+            self.keys = set()
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.keys
+
+    def add(self, key: str) -> None:
+        self.keys.add(key)
+        self._save()
+
+    def clear(self) -> None:
+        self.keys.clear()
+        self._save()
+
+    def _save(self) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        KEYS_FILE.write_text(json.dumps(sorted(self.keys)) + '\n')
+        KEYS_FILE.chmod(0o600)
+
+
+class UInputDevice:
+    UI_SET_EVBIT = 0x40045564
+    UI_SET_KEYBIT = 0x40045565
+    UI_SET_RELBIT = 0x40045566
+    UI_DEV_SETUP = 0x405C5503
+    UI_DEV_CREATE = 0x5501
+    UI_DEV_DESTROY = 0x5502
+    BUS_VIRTUAL = 0x06
+
+    def __init__(self, name: str, product: int, keys=(), rels=()) -> None:
+        self.fd = os.open('/dev/uinput', os.O_WRONLY | os.O_NONBLOCK)
+        if keys:
+            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, EV_KEY)
+            for code in keys:
+                fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, code)
+        if rels:
+            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, EV_REL)
+            for code in rels:
+                fcntl.ioctl(self.fd, self.UI_SET_RELBIT, code)
+        setup = struct.pack('HHHH80sI', self.BUS_VIRTUAL, 0x1209, product, 1, name.encode(), 0)
+        fcntl.ioctl(self.fd, self.UI_DEV_SETUP, setup)
+        fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+
+    def emit(self, *events: tuple[int, int, int]) -> None:
+        frame = b''.join(struct.pack('llHHi', 0, 0, *event) for event in events)
+        os.write(self.fd, frame + struct.pack('llHHi', 0, 0, EV_SYN, SYN_REPORT, 0))
+
+    def close(self) -> None:
+        try:
+            fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
+        finally:
+            os.close(self.fd)
+
+
+class NullDevice:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def emit(self, *events: tuple[int, int, int]) -> None:
+        log.info('[%s] %s', self.name, events)
+
+    def close(self) -> None:
+        pass
+
+
+class XkbLayout:
+    """Reverse keymap (character -> evdev key + modifiers) for the layout the compositor is using."""
+
+    XKB_MOD_INVALID = 0xFFFFFFFF
+    KEYSYM_ISO_LEVEL3_SHIFT = 0xFE03
+    DEAD_KEYS = {'`': 0xFE50, '´': 0xFE51, '^': 0xFE52, '~': 0xFE53, '¨': 0xFE57}
+
+    class RuleNames(ctypes.Structure):
+        _fields_ = [('rules', ctypes.c_char_p), ('model', ctypes.c_char_p), ('layout', ctypes.c_char_p),
+                    ('variant', ctypes.c_char_p), ('options', ctypes.c_char_p)]
+
+    def __init__(self, layout: str, variant: str, options: str) -> None:
+        self.description = f'{layout}{"+" + variant if variant else ""}'
+        self.keysym_to_key: dict[int, tuple[int, bool, bool]] = {}
+        self.altgr_code = KEY_RIGHTALT
+        lib = ctypes.CDLL(ctypes.util.find_library('xkbcommon') or 'libxkbcommon.so.0')
+        self.lib = lib
+        lib.xkb_context_new.restype = ctypes.c_void_p
+        lib.xkb_context_new.argtypes = [ctypes.c_int]
+        lib.xkb_context_unref.argtypes = [ctypes.c_void_p]
+        lib.xkb_keymap_new_from_names.restype = ctypes.c_void_p
+        lib.xkb_keymap_new_from_names.argtypes = [ctypes.c_void_p, ctypes.POINTER(self.RuleNames), ctypes.c_int]
+        lib.xkb_keymap_unref.argtypes = [ctypes.c_void_p]
+        for name in ('xkb_keymap_min_keycode', 'xkb_keymap_max_keycode'):
+            getattr(lib, name).restype = ctypes.c_uint32
+            getattr(lib, name).argtypes = [ctypes.c_void_p]
+        lib.xkb_keymap_num_layouts_for_key.restype = ctypes.c_uint32
+        lib.xkb_keymap_num_layouts_for_key.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        lib.xkb_keymap_num_levels_for_key.restype = ctypes.c_uint32
+        lib.xkb_keymap_num_levels_for_key.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+        lib.xkb_keymap_key_get_syms_by_level.restype = ctypes.c_int
+        lib.xkb_keymap_key_get_syms_by_level.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32))]
+        lib.xkb_keymap_key_get_mods_for_level.restype = ctypes.c_size_t
+        lib.xkb_keymap_key_get_mods_for_level.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.c_size_t]
+        lib.xkb_keymap_mod_get_index.restype = ctypes.c_uint32
+        lib.xkb_keymap_mod_get_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.xkb_utf32_to_keysym.restype = ctypes.c_uint32
+        lib.xkb_utf32_to_keysym.argtypes = [ctypes.c_uint32]
+
+        context = lib.xkb_context_new(0)
+        if not context:
+            raise OSError('xkb_context_new failed')
+        names = self.RuleNames(b'evdev', b'pc105', layout.encode(), variant.encode() or None,
+                               options.encode() or None)
+        keymap = lib.xkb_keymap_new_from_names(context, ctypes.byref(names), 0)
+        if not keymap:
+            lib.xkb_context_unref(context)
+            raise OSError(f'Unknown keyboard layout {self.description}')
+        try:
+            self._index(keymap)
+        finally:
+            lib.xkb_keymap_unref(keymap)
+            lib.xkb_context_unref(context)
+
+    def _mask(self, keymap, *names: str) -> int:
+        mask = 0
+        for name in names:
+            index = self.lib.xkb_keymap_mod_get_index(keymap, name.encode())
+            if index != self.XKB_MOD_INVALID:
+                mask |= 1 << index
+        return mask
+
+    def _index(self, keymap) -> None:
+        lib = self.lib
+        shift = self._mask(keymap, 'Shift')
+        level3 = self._mask(keymap, 'Mod5', 'LevelThree')
+        best: dict[int, tuple[int, int, bool, bool]] = {}
+        syms = ctypes.POINTER(ctypes.c_uint32)()
+        masks = (ctypes.c_uint32 * 16)()
+        for keycode in range(lib.xkb_keymap_min_keycode(keymap), lib.xkb_keymap_max_keycode(keymap) + 1):
+            if not lib.xkb_keymap_num_layouts_for_key(keymap, keycode):
+                continue
+            evdev = keycode - 8
+            if evdev not in KEYBOARD_CODES:
+                continue
+            for level in range(lib.xkb_keymap_num_levels_for_key(keymap, keycode, 0)):
+                if lib.xkb_keymap_key_get_syms_by_level(keymap, keycode, 0, level, ctypes.byref(syms)) != 1:
+                    continue
+                keysym = syms[0]
+                if keysym == self.KEYSYM_ISO_LEVEL3_SHIFT and level == 0:
+                    self.altgr_code = evdev
+                count = lib.xkb_keymap_key_get_mods_for_level(keymap, keycode, 0, level, masks, len(masks))
+                for mask in masks[:count]:
+                    if mask & ~(shift | level3):
+                        continue
+                    needs_shift, needs_altgr = bool(mask & shift), bool(mask & level3)
+                    cost = needs_shift + 2 * needs_altgr + 4 * (evdev in KEYPAD_CODES)
+                    if keysym not in best or (cost, evdev) < best[keysym][:2]:
+                        best[keysym] = (cost, evdev, needs_shift, needs_altgr)
+        self.keysym_to_key = {sym: (evdev, s, a) for sym, (_, evdev, s, a) in best.items()}
+
+    def lookup(self, char: str) -> tuple[int, bool, bool] | None:
+        return self.keysym_to_key.get(self.lib.xkb_utf32_to_keysym(ord(char)))
+
+    def lookup_dead(self, char: str) -> tuple[int, bool, bool] | None:
+        keysym = self.DEAD_KEYS.get(char)
+        return self.keysym_to_key.get(keysym) if keysym else None
+
+
+US_FALLBACK = {c: (code, False, False) for c, code in zip('1234567890', range(2, 12))}
+US_FALLBACK.update({c: (code, False, False) for c, code in zip('qwertyuiop', range(16, 26))})
+US_FALLBACK.update({c: (code, False, False) for c, code in zip('asdfghjkl', range(30, 39))})
+US_FALLBACK.update({c: (code, False, False) for c, code in zip('zxcvbnm', range(44, 51))})
+US_FALLBACK.update({c.upper(): (code, True, False) for c, (code, _, _) in list(US_FALLBACK.items()) if c.isalpha()})
+US_FALLBACK.update({' ': (KEY_SPACE, False, False), '-': (12, False, False), '=': (13, False, False),
+                    '[': (26, False, False), ']': (27, False, False), ';': (39, False, False),
+                    "'": (40, False, False), '`': (41, False, False), '\\': (43, False, False),
+                    ',': (51, False, False), '.': (52, False, False), '/': (53, False, False),
+                    '!': (2, True, False), '@': (3, True, False), '#': (4, True, False), '$': (5, True, False),
+                    '%': (6, True, False), '^': (7, True, False), '&': (8, True, False), '*': (9, True, False),
+                    '(': (10, True, False), ')': (11, True, False), '_': (12, True, False),
+                    '+': (13, True, False), '{': (26, True, False), '}': (27, True, False),
+                    ':': (39, True, False), '"': (40, True, False), '~': (41, True, False),
+                    '|': (43, True, False), '<': (51, True, False), '>': (52, True, False),
+                    '?': (53, True, False)})
+
+
+def detect_keyboard_layout(override: str) -> tuple[str, str, str]:
+    """(layout, variant, options) of the active input source; GNOME first, then /etc/default/keyboard."""
+    entry, options = override, ''
+    if not entry:
+        for key in ('mru-sources', 'sources'):
+            out = run(['gsettings', 'get', 'org.gnome.desktop.input-sources', key], timeout=2) or ''
+            sources = re.findall(r"\('xkb',\s*'([^']+)'\)", out)
+            if sources:
+                entry = sources[0]
+                break
+        out = run(['gsettings', 'get', 'org.gnome.desktop.input-sources', 'xkb-options'], timeout=2) or ''
+        options = ','.join(re.findall(r"'([^']+)'", out))
+    if not entry:
+        try:
+            defaults = dict(re.findall(r'^\s*(XKB\w+)\s*=\s*"?([^"\n]*)"?', Path('/etc/default/keyboard').read_text(),
+                                       re.M))
+        except OSError:
+            defaults = {}
+        layout = defaults.get('XKBLAYOUT', 'us').split(',')[0] or 'us'
+        variant = defaults.get('XKBVARIANT', '').split(',')[0]
+        return layout, variant, options or defaults.get('XKBOPTIONS', '')
+    layout, _, variant = entry.replace(':', '+').partition('+')
+    return layout, variant, options
+
+
+class Keyboard:
+    LAYOUT_TTL = 5.0
+
+    def __init__(self, device, settings: Settings) -> None:
+        self.device = device
+        self.settings = settings
+        self.held: dict[str, int] = {}
+        self._layout: XkbLayout | None = None
+        self._layout_key: tuple[str, str, str] | None = None
+        self._layout_checked = 0.0
+
+    def modifier_code(self, name: str) -> int:
+        if name == MOD_CMD:
+            return KEY_LEFTMETA if self.settings['cmd_key'] == 'super' else KEY_LEFTCTRL
+        return {MOD_SHIFT: KEY_LEFTSHIFT, MOD_ALT: KEY_LEFTALT, MOD_CTRL: KEY_RIGHTCTRL}[name]
+
+    def layout(self) -> XkbLayout | None:
+        now = time.monotonic()
+        if now - self._layout_checked > self.LAYOUT_TTL:
+            self._layout_checked = now
+            key = detect_keyboard_layout(self.settings['keyboard_layout'])
+            if key != self._layout_key:
+                self._layout_key = key
+                try:
+                    self._layout = XkbLayout(*key)
+                    log.info('Keyboard layout: %s (%d symbols)', self._layout.description,
+                             len(self._layout.keysym_to_key))
+                except OSError as error:
+                    log.warning('Falling back to a US keymap: %s', error)
+                    self._layout = None
+        return self._layout
+
+    def key(self, code: int, down: bool) -> None:
+        self.device.emit((EV_KEY, code, 1 if down else 0))
+
+    def tap(self, code: int, *mods: int) -> None:
+        for mod in mods:
+            self.key(mod, True)
+        self.key(code, True)
+        self.key(code, False)
+        for mod in reversed(mods):
+            self.key(mod, False)
+
+    def latch(self, name: str, down: bool) -> None:
+        if down and name not in self.held:
+            self.held[name] = self.modifier_code(name)
+            self.key(self.held[name], True)
+        elif not down and name in self.held:
+            self.key(self.held.pop(name), False)
+
+    def release_all(self) -> None:
+        for name in list(self.held):
+            self.latch(name, False)
+
+    def resolve(self, char: str) -> tuple[int, bool, bool] | None:
+        layout = self.layout()
+        if layout:
+            return layout.lookup(char)
+        return US_FALLBACK.get(char)
+
+    def _press_resolved(self, code: int, needs_shift: bool, needs_altgr: bool) -> None:
+        shift_latched = MOD_SHIFT in self.held
+        mods = []
+        if needs_altgr:
+            mods.append(self.layout().altgr_code if self.layout() else KEY_RIGHTALT)
+        if needs_shift and not shift_latched:
+            mods.append(KEY_LEFTSHIFT)
+        if shift_latched and not needs_shift:
+            self.key(self.held[MOD_SHIFT], False)
+        self.tap(code, *mods)
+        if shift_latched and not needs_shift:
+            self.key(self.held[MOD_SHIFT], True)
+
+    def shortcut(self, char: str, *mods: int) -> None:
+        resolved = self.resolve(char)
+        if resolved:
+            self.tap(resolved[0], *mods)
+
+    def type_char(self, char: str) -> None:
+        if ord(char) in CONTROL_CHARS and char != ' ':
+            self.tap(CONTROL_CHARS[ord(char)])
+            return
+        resolved = self.resolve(char)
+        if resolved:
+            self._press_resolved(*resolved)
+            return
+        layout = self.layout()
+        dead = layout.lookup_dead(char) if layout else None
+        if dead:
+            self._press_resolved(*dead)
+            self.tap(KEY_SPACE)
+            return
+        self.type_unicode(char)
+
+    def type_unicode(self, char: str) -> None:
+        u = self.resolve('u')
+        if not u:
+            return
+        self.tap(u[0], KEY_LEFTCTRL, KEY_LEFTSHIFT)
+        for digit in f'{ord(char):x}':
+            resolved = self.resolve(digit)
+            if resolved:
+                self._press_resolved(*resolved)
+        self.tap(KEY_SPACE)
+
+    def char_code(self, code: int) -> None:
+        """Press a key given as NSEvent character code (arrows, F-keys, control characters, plain text)."""
+        if code in NS_FUNCTION_KEYS:
+            self.tap(NS_FUNCTION_KEYS[code])
+        elif code in CONTROL_CHARS:
+            self.tap(CONTROL_CHARS[code])
+        elif 0 < code < 0x110000:
+            self.type_char(chr(code))
+
+
+class Pointer:
+    WHEEL_DETENT = 120
+
+    def __init__(self, device, settings: Settings) -> None:
+        self.device = device
+        self.settings = settings
+        self.rest_x = self.rest_y = 0.0
+        self.wheel_rest = {REL_WHEEL: 0, REL_HWHEEL: 0}
+        self.drag_armed = False
+        self.drag_down = False
+        self.zoom_rest = 0.0
+
+    def move(self, dx: float, dy: float) -> None:
+        if self.drag_armed and not self.drag_down:
+            self.device.emit((EV_KEY, BTN_LEFT, 1))
+            self.drag_down = True
+        scale = float(self.settings['pointer_scale'])
+        self.rest_x += dx * scale
+        self.rest_y += dy * scale
+        step_x, step_y = int(self.rest_x), int(self.rest_y)
+        self.rest_x -= step_x
+        self.rest_y -= step_y
+        if step_x or step_y:
+            self.device.emit((EV_REL, REL_X, step_x), (EV_REL, REL_Y, step_y))
+
+    def click(self, button: int = BTN_LEFT) -> None:
+        self.device.emit((EV_KEY, button, 1))
+        self.device.emit((EV_KEY, button, 0))
+
+    def begin_drag(self) -> None:
+        self.drag_armed = True
+        self.drag_down = False
+
+    def end_drag(self) -> None:
+        if self.drag_down:
+            self.device.emit((EV_KEY, BTN_LEFT, 0))
+        self.drag_armed = self.drag_down = False
+
+    def natural_scrolling(self) -> bool:
+        return self.settings['scroll_direction'] != 1
+
+    def scroll(self, dx: float, dy: float) -> None:
+        # Mirrors the macOS helper's scroll shaping so the client's deltas feel the same.
+        if abs(dy) * 0.4 > abs(dx):
+            dx = 0.0
+        elif abs(dx) * 0.4 > abs(dy):
+            dy = 0.0
+        if dx > 0:
+            dx = max(dx, 1.0)
+        elif dx < 0:
+            dx = min(dx, -1.0)
+        dx = max(-5.0, min(5.0, dx))
+        dy = max(-10.0, min(10.0, dy))
+        direction = 1.0 if self.natural_scrolling() else -1.0
+        scale = float(self.settings['scroll_scale'])
+        self.wheel(REL_WHEEL, REL_WHEEL_HI_RES, round(dy * direction * scale))
+        self.wheel(REL_HWHEEL, REL_HWHEEL_HI_RES, round(-dx * direction * scale))
+
+    def wheel(self, axis: int, hi_res_axis: int, amount: int) -> None:
+        if not amount:
+            return
+        events = [(EV_REL, hi_res_axis, amount)]
+        rest = self.wheel_rest[axis] + amount
+        detents = int(rest / self.WHEEL_DETENT)
+        self.wheel_rest[axis] = rest - detents * self.WHEEL_DETENT
+        if detents:
+            events.append((EV_REL, axis, detents))
+        self.device.emit(*events)
+
+    def ctrl_scroll_zoom(self, delta: float, keyboard: Keyboard) -> None:
+        self.zoom_rest += delta
+        while abs(self.zoom_rest) >= 0.1:
+            step = 1 if self.zoom_rest > 0 else -1
+            self.zoom_rest -= 0.1 * step
+            keyboard.key(KEY_LEFTCTRL, True)
+            self.device.emit((EV_REL, REL_WHEEL_HI_RES, step * self.WHEEL_DETENT), (EV_REL, REL_WHEEL, step))
+            keyboard.key(KEY_LEFTCTRL, False)
+
+
+class ScreenZoom:
+    """Pinch-to-zoom on the GNOME Shell magnifier, with the macOS helper's curve (zoom += delta / 3, 1x-4x)."""
+
+    MAX_FACTOR = 4.0
+    MAGNIFIER = 'org.gnome.desktop.a11y.magnifier'
+    APPLICATIONS = 'org.gnome.desktop.a11y.applications'
+
+    def __init__(self) -> None:
+        self.factor = 1.0
+        self.applied = 1.0
+        self.gio = self.magnifier = self.applications = None
+        self.saved_factor: float | None = None
+        try:
+            import gi
+            gi.require_version('Gio', '2.0')
+            from gi.repository import Gio
+            source = Gio.SettingsSchemaSource.get_default()
+            if source and source.lookup(self.MAGNIFIER, True) and source.lookup(self.APPLICATIONS, True):
+                self.gio = Gio
+                self.magnifier = Gio.Settings.new(self.MAGNIFIER)
+                self.applications = Gio.Settings.new(self.APPLICATIONS)
+        except (ImportError, ValueError) as error:
+            log.info('Screen zoom unavailable (%s)', error)
+
+    @property
+    def available(self) -> bool:
+        return self.magnifier is not None
+
+    def pinch(self, delta: float) -> None:
+        factor = self.factor + delta / 3
+        if factor < 1.1 and delta < 0:
+            factor = 1.0
+        self.factor = max(1.0, min(self.MAX_FACTOR, factor))
+        if abs(self.factor - self.applied) >= 0.02 or (self.factor == 1.0) != (self.applied == 1.0):
+            self.apply()
+
+    def reset(self) -> None:
+        if self.factor != 1.0 or self.applied != 1.0:
+            self.factor = 1.0
+            self.apply()
+
+    def apply(self) -> None:
+        if not self.available:
+            return
+        if self.factor > 1.0:
+            if self.saved_factor is None:
+                self.saved_factor = self.magnifier.get_double('mag-factor')
+            self.magnifier.set_double('mag-factor', round(self.factor, 2))
+            if not self.applications.get_boolean('screen-magnifier-enabled'):
+                self.applications.set_boolean('screen-magnifier-enabled', True)
+        else:
+            self.applications.set_boolean('screen-magnifier-enabled', False)
+            if self.saved_factor is not None:
+                self.magnifier.set_double('mag-factor', self.saved_factor)
+                self.saved_factor = None
+        self.gio.Settings.sync()
+        self.applied = self.factor
+
+
+class Audio:
+    @staticmethod
+    def volume() -> tuple[float, bool] | None:
+        out = run(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'], timeout=2)
+        if out:
+            match = re.search(r'Volume:\s*([\d.]+)', out)
+            if match:
+                return min(float(match.group(1)), 1.0), 'MUTED' in out
+        volume_out = run(['pactl', 'get-sink-volume', '@DEFAULT_SINK@'], timeout=2)
+        mute_out = run(['pactl', 'get-sink-mute', '@DEFAULT_SINK@'], timeout=2)
+        if volume_out:
+            match = re.search(r'(\d+)%', volume_out)
+            if match:
+                return min(int(match.group(1)) / 100, 1.0), bool(mute_out and 'yes' in mute_out)
+        return None
+
+    @staticmethod
+    def set_volume(value: float) -> None:
+        value = max(0.0, min(1.0, value))
+        if run(['wpctl', 'set-volume', '@DEFAULT_AUDIO_SINK@', f'{value:.2f}'], timeout=2) is None:
+            run(['pactl', 'set-sink-volume', '@DEFAULT_SINK@', f'{round(value * 100)}%'], timeout=2)
+
+    @staticmethod
+    def set_mute(muted: bool) -> None:
+        if run(['wpctl', 'set-mute', '@DEFAULT_AUDIO_SINK@', '1' if muted else '0'], timeout=2) is None:
+            run(['pactl', 'set-sink-mute', '@DEFAULT_SINK@', '1' if muted else '0'], timeout=2)
+
+    @staticmethod
+    def routes() -> str:
+        """Output devices in the helper's AirPlay route format: name,uid,type,picked joined by $RR$."""
+        sinks = json.loads(run(['pactl', '-f', 'json', 'list', 'sinks'], timeout=3) or '[]')
+        default = (run(['pactl', 'get-default-sink'], timeout=2) or '').strip()
+        routes = []
+        for sink in sinks:
+            name = sink.get('description') or sink.get('name', '')
+            uid = sink.get('name', '')
+            route_type = 2 if 'pci' in uid or 'platform' in uid else 1
+            routes.append(','.join([name.replace(',', '*RC*'), uid.replace(',', '*RC*'),
+                                    str(route_type), str(int(uid == default))]))
+        return '$RR$'.join(routes)
+
+    @staticmethod
+    def pick_route(uid: str) -> None:
+        run(['pactl', 'set-default-sink', uid.replace('*RC*', ',')], timeout=3)
+
+
+class Apps:
+    DATA_DIRS = [Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')] + [
+        Path(p) for p in (os.environ.get('XDG_DATA_DIRS') or
+                          '/usr/local/share:/usr/share:/var/lib/snapd/desktop:/var/lib/flatpak/exports/share'
+                          ).split(':') if p]
+    ICON_THEMES = ['hicolor', 'Yaru', 'Adwaita', 'breeze']
+
+    @classmethod
+    def desktop_file(cls, app_id: str) -> Path | None:
+        name = app_id if app_id.endswith('.desktop') else app_id + '.desktop'
+        for base in cls.DATA_DIRS:
+            path = base / 'applications' / name
+            if path.is_file():
+                return path
+        return None
+
+    @staticmethod
+    def desktop_entry(path: Path) -> dict[str, str]:
+        entry, in_main = {}, False
+        try:
+            lines = path.read_text(errors='replace').splitlines()
+        except OSError:
+            return entry
+        for line in lines:
+            line = line.strip()
+            if line.startswith('['):
+                in_main = line == '[Desktop Entry]'
+            elif in_main and '=' in line:
+                key, _, value = line.partition('=')
+                entry.setdefault(key.strip(), value.strip())
+        return entry
+
+    @classmethod
+    def display_name(cls, app_id: str) -> str:
+        path = cls.desktop_file(app_id)
+        entry = cls.desktop_entry(path) if path else {}
+        lang = (os.environ.get('LANG') or '').split('.')[0]
+        return entry.get(f'Name[{lang}]') or entry.get(f'Name[{lang[:2]}]') or entry.get('Name') or app_id
+
+    @staticmethod
+    def favorites() -> list[str]:
+        out = run(['gsettings', 'get', 'org.gnome.shell', 'favorite-apps'], timeout=2) or ''
+        return [app.removesuffix('.desktop') for app in re.findall(r"'([^']+)'", out)]
+
+    @classmethod
+    def launch(cls, app_id: str) -> None:
+        app_id = app_id.replace('^RS^', ' ')
+        if not spawn(['gtk-launch', app_id]):
+            path = cls.desktop_file(app_id)
+            if path:
+                spawn(['gio', 'launch', str(path)])
+
+    @classmethod
+    def icon_png(cls, app_id: str, size: int) -> bytes | None:
+        app_id = app_id.replace('^RS^', ' ')
+        if app_id == THIS_COMPUTER_ID:
+            icon = 'computer'
+        else:
+            path = cls.desktop_file(app_id)
+            icon = cls.desktop_entry(path).get('Icon', '') if path else ''
+        if not icon:
+            return None
+        file = Path(icon) if icon.startswith('/') else cls.find_icon(icon, size)
+        if not file or not file.is_file():
+            return None
+        return cls.render_png(file, size)
+
+    @classmethod
+    def icon_themes(cls) -> list[str]:
+        out = run(['gsettings', 'get', 'org.gnome.desktop.interface', 'icon-theme'], timeout=2) or ''
+        return list(dict.fromkeys(filter(None, [out.strip().strip("'"), *cls.ICON_THEMES])))
+
+    @classmethod
+    def find_icon(cls, name: str, size: int) -> Path | None:
+        themes = cls.icon_themes()
+        bases = cls.DATA_DIRS + [Path.home() / '.icons']
+        candidates: list[tuple[int, int, Path]] = []
+        for priority, theme in enumerate(themes):
+            for base in bases:
+                root = base / theme if base.name == '.icons' else base / 'icons' / theme
+                if root.is_dir():
+                    candidates += [(priority, cls._icon_rank(path.parent.parent.name, size), path)
+                                   for path in root.glob(f'*/*/{name}.*') if path.suffix in ('.png', '.svg')]
+        for base in bases:
+            for ext in ('png', 'svg'):
+                if (base / 'pixmaps' / f'{name}.{ext}').is_file():
+                    candidates.append((len(themes), 0, base / 'pixmaps' / f'{name}.{ext}'))
+        return min(candidates)[2] if candidates else None
+
+    @staticmethod
+    def _icon_rank(directory: str, size: int) -> int:
+        if directory == 'scalable':
+            return 50
+        match = re.match(r'(\d+)x\d+', directory)
+        if not match:
+            return 5_000
+        actual = int(match.group(1))
+        return actual - size if actual >= size else 1_000 + size - actual
+
+    @staticmethod
+    def render_png(path: Path, size: int) -> bytes | None:
+        try:
+            import gi
+            gi.require_version('GdkPixbuf', '2.0')
+            from gi.repository import GdkPixbuf
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), size, size, True)
+            ok, data = pixbuf.save_to_bufferv('png', [], [])
+            if ok:
+                return bytes(data)
+        except Exception as error:
+            log.debug('GdkPixbuf could not render %s: %s', path, error)
+        if path.suffix == '.png':
+            return path.read_bytes()
+        out = subprocess.run(['rsvg-convert', '-w', str(size), '-h', str(size), str(path)],
+                             capture_output=True) if shutil.which('rsvg-convert') else None
+        return out.stdout if out and out.returncode == 0 else None
+
+
+class System:
+    @staticmethod
+    def server_name() -> str:
+        try:
+            for line in Path('/etc/machine-info').read_text().splitlines():
+                if line.startswith('PRETTY_HOSTNAME='):
+                    name = line.split('=', 1)[1].strip().strip('"')
+                    if name:
+                        return name
+        except OSError:
+            pass
+        return socket.gethostname().removesuffix('.local')
+
+    @staticmethod
+    def mac_addresses() -> tuple[str, list[str]]:
+        primary = ''
+        try:
+            for line in Path('/proc/net/route').read_text().splitlines()[1:]:
+                fields = line.split()
+                if len(fields) > 2 and fields[1] == '00000000':
+                    primary = fields[0]
+                    break
+        except OSError:
+            pass
+        addresses, primary_mac = [], ''
+        net = Path('/sys/class/net')
+        interfaces = sorted(net.iterdir()) if net.is_dir() else []
+        physical = [iface for iface in interfaces if (iface / 'device').exists()]
+        for iface in physical or [iface for iface in interfaces if iface.name != 'lo']:
+            try:
+                mac = (iface / 'address').read_text().strip()
+            except OSError:
+                continue
+            if mac and mac != '00:00:00:00:00:00':
+                addresses.append(mac)
+                if iface.name == primary:
+                    primary_mac = mac
+        return primary_mac or (addresses[0] if addresses else ''), addresses
+
+    @staticmethod
+    def display_count() -> int:
+        count = 0
+        for status in Path('/sys/class/drm').glob('card*-*/status'):
+            try:
+                count += status.read_text().strip() == 'connected'
+            except OSError:
+                pass
+        return max(count, 1)
+
+    @staticmethod
+    def blank_screen() -> None:
+        run(['busctl', '--user', 'call', 'org.gnome.ScreenSaver', '/org/gnome/ScreenSaver',
+             'org.gnome.ScreenSaver', 'SetActive', 'b', 'true'], timeout=3)
+
+
+class PendingAuth:
+    def __init__(self, client: 'Client', device_hash: str, device_name: str) -> None:
+        self.client = client
+        self.device_hash = device_hash
+        self.device_name = device_name
+        self.process: asyncio.subprocess.Process | None = None
+
+    def cancel(self) -> None:
+        if self.process and self.process.returncode is None:
+            self.process.terminate()
+
+
+class Client:
+    def __init__(self, helper: 'Helper', reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.helper = helper
+        self.reader = reader
+        self.writer = writer
+        peer = writer.get_extra_info('peername') or ('?', 0)
+        self.address = peer[0].removeprefix('::ffff:')
+        self.label = f'{self.address}:{peer[1]}'
+        self.authenticated = False
+
+    def send(self, line: str) -> None:
+        if self.writer.is_closing():
+            return
+        log.debug('-> %s %s', self.label, line)
+        self.writer.write(line.encode() + b'\r\n')
+
+    def send_raw(self, data: bytes) -> None:
+        if not self.writer.is_closing():
+            self.writer.write(data)
+
+    async def serve(self) -> None:
+        log.info('%s connected', self.label)
+        try:
+            while True:
+                try:
+                    data = await self.reader.readuntil(b'\r\n')
+                except asyncio.LimitOverrunError:
+                    await self.reader.read(65536)
+                    continue
+                line = data[:-2].decode('utf-8', errors='replace')
+                log.debug('<- %s %s', self.label, line)
+                try:
+                    await self.helper.handle_line(self, line)
+                except Exception:
+                    log.exception('Error handling %r from %s', line, self.label)
+                await self.writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            log.info('%s disconnected', self.label)
+            self.helper.client_gone(self)
+            self.writer.close()
+
+
+class UdpProtocol(asyncio.DatagramProtocol):
+    def __init__(self, helper: 'Helper') -> None:
+        self.helper = helper
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        self.helper.handle_datagram(data.decode('utf-8', errors='replace'), addr[0].removeprefix('::ffff:'))
+
+
+class Helper:
+    def __init__(self, settings: Settings, dry_run: bool = False) -> None:
+        self.settings = settings
+        self.keys = KeyStore()
+        self.clients: set[Client] = set()
+        self.pending: dict[Client, PendingAuth] = {}
+        self.last_volume: tuple[float, bool] | None = None
+        self.devices = []
+        keyboard_device, pointer_device = self._create_devices(dry_run)
+        self.keyboard = Keyboard(keyboard_device, settings)
+        self.pointer = Pointer(pointer_device, settings)
+        self.zoom = ScreenZoom()
+
+    def _create_devices(self, dry_run: bool):
+        if not dry_run:
+            try:
+                keyboard = UInputDevice('tuxmote keyboard', 0x5201, keys=KEYBOARD_CODES)
+                pointer = UInputDevice('tuxmote pointer', 0x5202, keys=(BTN_LEFT, BTN_RIGHT, BTN_MIDDLE),
+                                       rels=(REL_X, REL_Y, REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES,
+                                             REL_HWHEEL_HI_RES))
+                self.devices = [keyboard, pointer]
+                return keyboard, pointer
+            except OSError as error:
+                log.error('Cannot open /dev/uinput (%s). Run install.sh or check the udev rule; '
+                          'continuing without input injection.', error)
+        return NullDevice('keyboard'), NullDevice('pointer')
+
+    def close(self) -> None:
+        self.keyboard.release_all()
+        self.pointer.end_drag()
+        self.zoom.reset()
+        for device in self.devices:
+            device.close()
+
+    def authenticated_clients(self) -> list[Client]:
+        return [client for client in self.clients if client.authenticated]
+
+    def client_gone(self, client: Client) -> None:
+        self.clients.discard(client)
+        pending = self.pending.pop(client, None)
+        if pending:
+            pending.cancel()
+        if not self.authenticated_clients():
+            self.keyboard.release_all()
+            self.pointer.end_drag()
+            self.zoom.reset()
+
+    def pinch(self, delta: float) -> None:
+        mode = self.settings['pinch_zoom']
+        if mode in ('screen', True) and self.zoom.available:
+            self.zoom.pinch(delta)
+        elif mode in ('screen', 'ctrl-scroll', True):
+            self.pointer.ctrl_scroll_zoom(delta, self.keyboard)
+
+    def handle_datagram(self, text: str, address: str) -> None:
+        for line in filter(None, re.split(r'[\r\n]+', text)):
+            if line.startswith('UDP_TEST'):
+                for client in self.clients:
+                    client.send('UDP_OKAY')
+            elif len(line) >= 2 and line[0] == '{':
+                if any(c.address == address for c in self.authenticated_clients()):
+                    point = parse_point(line)
+                    if point:
+                        self.pointer.move(*point)
+                else:
+                    log.debug('Dropping UDP move from unauthenticated %s', address)
+
+    async def handle_line(self, client: Client, line: str) -> None:
+        if client.authenticated and line.startswith('k '):
+            for char in line[2:]:
+                self.keyboard.type_char(char)
+                # evdev drops events beyond ~64 queued per reader, so long pastes need pacing.
+                await asyncio.sleep(0.004)
+            return
+        if client.authenticated and self.handle_remote_control(client, line):
+            return
+        primary, _, secondary = line.partition(' ')
+        if await self.handle_info_command(client, line, primary, secondary or None):
+            return
+        if primary == 'KEY':
+            self.handle_key(client, secondary)
+            return
+        if primary == 'KEYREQUEST':
+            device_hash, _, device_name = secondary.partition(' ')
+            if device_hash:
+                asyncio.create_task(self.request_pin(client, device_hash, device_name or 'your device'))
+            else:
+                log.warning('Missing hash or name in %r', line)
+            return
+        if not client.authenticated:
+            log.info('%s is not authenticated [%s]', client.label, line)
+            client.send('KEY UNAUTHORIZED')
+            return
+        await self.handle_command(client, line, primary, secondary or None)
+
+    async def handle_info_command(self, client: Client, line: str, primary: str, secondary: str | None) -> bool:
+        if primary == 'PING-APP' or primary == 'PING':
+            # "PONG <app>$RR$<bundle id>" needs the focused app, which Wayland does not expose.
+            client.send('PONG')
+        elif primary == 'VERSION':
+            version = HELPER_VERSION if secondary and secondary.startswith('v') else LEGACY_VERSION
+            client.send(f'VERSION {version} {REPORTED_OS}')
+        elif primary == 'SERVERNAME':
+            client.send(f'SERVERNAME {System.server_name()}')
+        elif line == 'START REMOTE CONTROL' or line == 'CHECK FOR UPDATES':
+            pass
+        elif primary == 'CALL':
+            if secondary == 'CONNECTED' and self.settings['pause_on_call']:
+                self.keyboard.tap(KEY_PAUSECD)
+        elif primary == 'PAUSEONCALL':
+            self.settings.set('pause_on_call', parse_int(secondary) != 0)
+        elif primary == 'GET_SETTINGS':
+            client.send(f'3_FINGER_DRAG {int(bool(self.settings["three_finger_drag"]))}')
+        elif primary == 'MACADDRESS':
+            client.send(f'MACADDRESS {System.mac_addresses()[0]}')
+        elif primary == 'MACADDRESSES':
+            addresses = System.mac_addresses()[1]
+            if addresses:
+                client.send(f'MACADDRESSES {";".join(addresses)}')
+        elif primary in ('GETAPPS', 'GETAPPS_NAMES'):
+            for reply in await asyncio.to_thread(self.app_lists, primary == 'GETAPPS_NAMES'):
+                client.send(reply)
+        elif primary == 'GETICON':
+            icon = await asyncio.to_thread(self.icon_reply, secondary or '')
+            if icon:
+                client.send_raw(icon)
+        else:
+            return False
+        return True
+
+    @staticmethod
+    def app_lists(with_names: bool) -> list[str]:
+        favorites = Apps.favorites()
+        if with_names:
+            entries = [f'{a.replace(" ", "^RS^")} {Apps.display_name(a).replace(",", "$RR$")}' for a in favorites]
+            return [f'DOCKAPPS_NAMES {",".join(entries)}', 'RUNNINGAPPS_NAMES ', 'CONTROLLEDAPPS ']
+        return [f'DOCKAPPS {",".join(a.replace(" ", "^RS^") for a in favorites)}', 'RUNNINGAPPS ', 'CONTROLLEDAPPS ']
+
+    @staticmethod
+    def icon_reply(arguments: str) -> bytes | None:
+        parts = arguments.split(' ')
+        if not parts[0]:
+            return None
+        size = parse_int(parts[1], 80) if len(parts) > 1 else 80
+        png = Apps.icon_png(parts[0], max(16, min(size, 512)))
+        if not png:
+            return None
+        log.debug('Sending icon for %s (%d bytes)', parts[0], len(png))
+        return f'ICON {parts[0]} {len(png)}\r\n'.encode() + png
+
+    def handle_key(self, client: Client, key: str) -> None:
+        if key and key in self.keys:
+            client.authenticated = True
+            client.send('KEY OK')
+            log.info('%s authenticated', client.label)
+        else:
+            client.send('KEY INVALID')
+
+    async def request_pin(self, client: Client, device_hash: str, device_name: str) -> None:
+        if client in self.pending:
+            return
+        pending = PendingAuth(client, device_hash, device_name)
+        self.pending[client] = pending
+        log.info('Pairing requested by %s (%s). Enter the PIN shown on the device, or run: tuxmote pin <PIN>',
+                 device_name, client.label)
+        german = (os.environ.get('LANG') or '').startswith('de')
+        text = (f'„{device_name}“ möchte diesen Rechner fernsteuern.\nPIN vom Gerät eingeben:' if german else
+                f'"{device_name}" wants to control this computer.\nEnter the PIN shown on the device:')
+        if not shutil.which('zenity') or not (os.environ.get('WAYLAND_DISPLAY') or os.environ.get('DISPLAY')):
+            spawn(['notify-send', '-a', 'tuxmote', 'tuxmote', text + ' (tuxmote pin <PIN>)'])
+            return
+        pending.process = await asyncio.create_subprocess_exec(
+            'zenity', '--entry', '--title=tuxmote', f'--text={text}', '--width=420',
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        stdout, _ = await pending.process.communicate()
+        if pending.process.returncode == 0 and self.pending.get(client) is pending:
+            self.accept_pin(pending, stdout.decode().strip())
+        elif self.pending.get(client) is pending:
+            del self.pending[client]
+
+    def accept_pin(self, pending: PendingAuth, pin: str) -> bool:
+        if not pin:
+            return False
+        key = hashlib.md5((pending.device_hash + pin + pending.device_hash).encode()).hexdigest()
+        self.keys.add(key)
+        self.pending.pop(pending.client, None)
+        pending.cancel()
+        pending.client.send('KEY READY')
+        log.info('Paired %s', pending.device_name)
+        return True
+
+    def handle_remote_control(self, client: Client, line: str) -> bool:
+        keyboard, pointer = self.keyboard, self.pointer
+        if len(line) >= 2 and line[0] == '{':
+            point = parse_point(line)
+            if point:
+                pointer.move(*point)
+        elif line == 'CLICK':
+            pointer.click(BTN_LEFT)
+        elif line == 'RTCLICK':
+            pointer.click(BTN_RIGHT)
+        elif line.startswith('kf '):
+            self.function_key(parse_int(line[3:]))
+        elif line.startswith('s2 '):
+            parts = line[3:].split(';')
+            if len(parts) == 3:
+                delta, phase = parse_point(parts[0]), parse_int(parts[1])
+                if delta and phase == 2:
+                    pointer.scroll(*delta)
+                elif delta and phase == 3 and self.settings['three_finger_drag']:
+                    if not pointer.drag_armed:
+                        pointer.begin_drag()
+                    pointer.move(*delta)
+        elif line.startswith('s2-e '):
+            parts = line[5:].split(';')
+            if len(parts) == 2 and parse_int(parts[0]) == 3 and pointer.drag_armed:
+                pointer.end_drag()
+        elif line.startswith('s '):
+            delta = parse_point(line[2:])
+            if delta:
+                pointer.scroll(*delta)
+        elif line.startswith('p '):
+            self.pinch(parse_float(line[2:]))
+        elif line.startswith('km '):
+            name = line[3:]
+            down = not name.startswith('!')
+            name = name.lstrip('!')
+            if name in (MOD_CMD, MOD_ALT, MOD_CTRL, MOD_SHIFT):
+                keyboard.latch(name, down)
+        elif line.startswith('sf '):
+            self.swipe(parse_int(line[3:4]), parse_int(line[5:]))
+        elif line.startswith('TAP') or line.startswith('rot '):
+            log.debug('Ignoring gesture %r', line)
+        elif line == 'BEGINDRAG':
+            pointer.begin_drag()
+        elif line == 'ENDDRAG':
+            pointer.end_drag()
+        elif line == 'STOP REMOTE CONTROL':
+            keyboard.release_all()
+            pointer.end_drag()
+        elif line in ('PING-APP', 'PING'):
+            client.send('PONG')
+        else:
+            return False
+        return True
+
+    def function_key(self, code: int) -> None:
+        keyboard = self.keyboard
+        if self.settings['fkeys_as_media'] and NS_F1 <= code <= NS_F1 + 11:
+            # macOS F-row semantics; F5/F6 (keyboard backlight) are ignored by the original helper too.
+            mod_free = not keyboard.held
+            media = {0: KEY_BRIGHTNESSDOWN, 1: KEY_BRIGHTNESSUP, 6: KEY_PREVIOUSSONG, 7: KEY_PLAYPAUSE,
+                     8: KEY_NEXTSONG, 9: KEY_MUTE, 10: KEY_VOLUMEDOWN, 11: KEY_VOLUMEUP}
+            index = code - NS_F1
+            if index in media:
+                keyboard.tap(media[index])
+            elif index == 2 and mod_free:
+                keyboard.tap(KEY_LEFTMETA)
+            elif index == 3 and mod_free:
+                keyboard.shortcut('a', KEY_LEFTMETA)
+            return
+        keyboard.char_code(code)
+
+    def swipe(self, fingers: int, direction: int) -> None:
+        keyboard = self.keyboard
+        natural = self.pointer.natural_scrolling()
+        if direction in (1, 2) and fingers == 3:
+            keyboard.tap(KEY_RIGHT if direction == 1 else KEY_LEFT, KEY_LEFTALT)
+        elif direction in (1, 2):
+            towards_next = (direction == 1) == natural
+            keyboard.tap(KEY_PAGEDOWN if towards_next else KEY_PAGEUP, KEY_LEFTMETA)
+        elif direction == 4:
+            keyboard.tap(KEY_LEFTMETA)
+        elif direction == 8:
+            keyboard.shortcut('a', KEY_LEFTMETA)
+
+    def power_allowed(self, command: str) -> bool:
+        if not self.settings['allow_power_commands']:
+            log.warning('Ignoring %s (allow_power_commands is off)', command)
+            return False
+        return True
+
+    async def handle_command(self, client: Client, line: str, primary: str, secondary: str | None) -> None:
+        keyboard = self.keyboard
+        ctrl = KEY_LEFTCTRL
+        if primary == 'WILLRESIGN':
+            pass
+        elif primary == 'GETAIRPLAY':
+            client.send(f'AIRPLAY {await asyncio.to_thread(Audio.routes)}')
+        elif primary == 'SETAIRPLAY' and secondary:
+            await asyncio.to_thread(Audio.pick_route, secondary)
+            client.send(f'AIRPLAY {await asyncio.to_thread(Audio.routes)}')
+        elif primary == 'GETNUMDISPLAYS':
+            client.send(f'NUMDISPLAYS {System.display_count()}')
+        elif primary == 'SWITCHID' and secondary:
+            Apps.launch(secondary)
+        elif line == 'TOGGLE FULLSCREEN':
+            keyboard.tap(F_KEYS[10])
+        elif line == 'QUIT APPLICATION':
+            keyboard.shortcut('q', ctrl)
+        elif line == 'HIDE APPLICATION':
+            keyboard.shortcut('h', KEY_LEFTMETA)
+        elif line == 'CLOSE WINDOW':
+            keyboard.shortcut('w', ctrl)
+        elif line == 'EJECT DISC':
+            if not spawn(['eject']):
+                keyboard.tap(KEY_EJECTCD)
+        elif primary == 'VOLCONTROL':
+            pass
+        elif primary == 'GETVOL':
+            volume = await asyncio.to_thread(Audio.volume)
+            if volume:
+                client.send(f'VOL {volume[0]:0.2f}')
+        elif primary == 'SETVOL':
+            await asyncio.to_thread(Audio.set_volume, parse_float(secondary))
+        elif primary == 'VOL' and secondary in ('UP', 'DOWN'):
+            keyboard.tap(KEY_VOLUMEUP if secondary == 'UP' else KEY_VOLUMEDOWN)
+        elif primary == 'SETMUTE':
+            await asyncio.to_thread(Audio.set_mute, secondary == '1')
+        elif primary == 'GETMUTE':
+            volume = await asyncio.to_thread(Audio.volume)
+            if volume:
+                client.send(f'MUTED {int(volume[1])}')
+        elif primary == 'BRIGHT' and secondary in ('UP', 'DOWN'):
+            keyboard.tap(KEY_BRIGHTNESSUP if secondary == 'UP' else KEY_BRIGHTNESSDOWN)
+        elif primary == 'MIRROR_DISPLAY_TOGGLE':
+            keyboard.shortcut('p', KEY_LEFTMETA)
+        elif primary == 'SHUTDOWN':
+            if self.power_allowed(primary):
+                spawn(['systemctl', 'poweroff'])
+        elif primary == 'RESTART':
+            if self.power_allowed(primary):
+                spawn(['systemctl', 'reboot'])
+        elif primary == 'COMPUTER_SLEEP':
+            if self.power_allowed(primary):
+                spawn(['systemctl', 'suspend'])
+        elif primary == 'DISPLAY_SLEEP':
+            await asyncio.to_thread(System.blank_screen)
+        elif primary == 'SCROLL_DIR':
+            self.settings.set('scroll_direction', parse_int(secondary))
+        elif primary in REMOTE_BUTTON_CHARS or primary in ('PP', 'FF', 'RR'):
+            self.remote_button(primary, secondary or 'TAPPED')
+        else:
+            log.info('Unhandled command %r', line)
+
+    def remote_button(self, button: str, action: str) -> None:
+        keyboard = self.keyboard
+        if action not in ('TAPPED', 'PRESSED', 'REPEATED', 'RELEASED'):
+            return
+        if action == 'RELEASED' and button in ('UP', 'DOWN', 'PP', 'FF', 'RR'):
+            return
+        if button in ('UP', 'DOWN'):
+            keyboard.tap(KEY_VOLUMEUP if button == 'UP' else KEY_VOLUMEDOWN)
+            return
+        if button in ('PP', 'FF', 'RR'):
+            keyboard.tap({'PP': KEY_PLAYPAUSE, 'FF': KEY_FASTFORWARD, 'RR': KEY_REWIND}[button])
+            return
+        code = REMOTE_BUTTON_CHARS[button]
+        key = NS_FUNCTION_KEYS.get(code) or CONTROL_CHARS[code]
+        if action in ('PRESSED', 'REPEATED'):
+            keyboard.key(key, True)
+        elif action == 'RELEASED':
+            keyboard.key(key, False)
+        else:
+            keyboard.tap(key)
+
+    async def watch_volume(self) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            clients = self.authenticated_clients()
+            if not clients:
+                self.last_volume = None
+                continue
+            volume = await asyncio.to_thread(Audio.volume)
+            if volume is None or volume == self.last_volume:
+                continue
+            previous, self.last_volume = self.last_volume, volume
+            for client in clients:
+                if previous is None or abs(previous[0] - volume[0]) >= 0.005:
+                    client.send(f'VOL {volume[0]:0.2f}')
+                if previous is None or previous[1] != volume[1]:
+                    client.send(f'MUTED {int(volume[1])}')
+
+    async def control_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        line = (await reader.readline()).decode().strip()
+        command, _, argument = line.partition(' ')
+        if command == 'pin':
+            pending = next(reversed(self.pending.values()), None)
+            reply = 'paired' if pending and self.accept_pin(pending, argument) else 'no pairing request pending'
+        elif command == 'unpair':
+            self.keys.clear()
+            for client in self.clients:
+                client.authenticated = False
+            reply = 'all devices unpaired'
+        elif command == 'status':
+            reply = json.dumps({
+                'clients': [{'address': c.label, 'authenticated': c.authenticated} for c in self.clients],
+                'pending': [p.device_name for p in self.pending.values()],
+                'paired_keys': len(self.keys.keys),
+                'uinput': bool(self.devices),
+                'layout': self.keyboard.layout().description if self.keyboard.layout() else 'us (fallback)',
+            })
+        else:
+            reply = f'unknown command {command!r}'
+        writer.write(reply.encode() + b'\n')
+        await writer.drain()
+        writer.close()
+
+    async def serve(self) -> None:
+        port = int(self.settings['port'])
+
+        async def on_connect(reader, writer):
+            client = Client(self, reader, writer)
+            self.clients.add(client)
+            await client.serve()
+
+        server = await asyncio.start_server(on_connect, host=None, port=port, reuse_address=True)
+        loop = asyncio.get_running_loop()
+        udp_transports = []
+        for family, host in ((socket.AF_INET6, '::'), (socket.AF_INET, '0.0.0.0')):
+            try:
+                sock = socket.socket(family, socket.SOCK_DGRAM)
+                if family == socket.AF_INET6:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.bind((host, port))
+                transport, _ = await loop.create_datagram_endpoint(lambda: UdpProtocol(self), sock=sock)
+                udp_transports.append(transport)
+            except OSError as error:
+                log.debug('UDP on %s unavailable: %s', host, error)
+        try:
+            CONTROL_SOCKET.unlink(missing_ok=True)
+            control = await asyncio.start_unix_server(self.control_connection, path=str(CONTROL_SOCKET))
+            CONTROL_SOCKET.chmod(0o600)
+        except OSError as error:
+            control = None
+            log.warning('Control socket unavailable: %s', error)
+        log.info('tuxmote listening on TCP/UDP %d as "%s"', port, System.server_name())
+        asyncio.create_task(self.watch_volume())
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            for transport in udp_transports:
+                transport.close()
+            if control:
+                control.close()
+                CONTROL_SOCKET.unlink(missing_ok=True)
+
+
+def control_request(message: str) -> int:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(str(CONTROL_SOCKET))
+            sock.sendall(message.encode() + b'\n')
+            print(sock.makefile().read().strip())
+        return 0
+    except OSError as error:
+        print(f'tuxmote is not running ({error})', file=sys.stderr)
+        return 1
+
+
+def raise_interrupt(*_) -> None:
+    raise KeyboardInterrupt
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description='tuxmote: Rowmote Pro helper for Linux')
+    parser.add_argument('-v', '--verbose', action='store_true', help='log every protocol line')
+    parser.add_argument('--dry-run', action='store_true', help='log input events instead of using /dev/uinput')
+    sub = parser.add_subparsers(dest='command')
+    pin = sub.add_parser('pin', help='answer a pending pairing request with the PIN shown on the iPhone')
+    pin.add_argument('code')
+    sub.add_parser('unpair', help='forget all paired devices')
+    sub.add_parser('status', help='show connected and paired devices')
+    args = parser.parse_args()
+
+    if args.command == 'pin':
+        return control_request(f'pin {args.code}')
+    if args.command in ('unpair', 'status'):
+        return control_request(args.command)
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format='%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S')
+    helper = Helper(Settings(), dry_run=args.dry_run)
+    signal.signal(signal.SIGTERM, raise_interrupt)
+    try:
+        asyncio.run(helper.serve())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        helper.close()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
