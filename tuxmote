@@ -973,6 +973,8 @@ class Helper:
                         self.pointer.move(*point)
                 else:
                     log.debug('Dropping UDP move from unauthenticated %s', address)
+            else:
+                log.info('Ignoring UDP %r from %s', line[:80], address)
 
     async def handle_line(self, client: Client, line: str) -> None:
         if client.authenticated and line.startswith('k '):
